@@ -35,6 +35,9 @@ check that 7 squares measure 266 mm. If they don't, pass the measured size with
 
 ## Run
 
+`./run_demo.sh` runs the demo with the `femto_bolt` env's Python, no activation
+needed, and passes its arguments through (`./run_demo.sh --depth`). Or directly:
+
 ```bash
 conda activate femto_bolt
 python charuco_demo.py                  # 1280x720 color, pose overlay
