@@ -122,15 +122,20 @@ def run_camera(args, board, detector):
     from pyorbbecsdk import (AlignFilter, Config, Context, OBFrameAggregateOutputMode,
                              OBSensorType, OBStreamType, Pipeline)
 
-    devices = Context().query_devices()
+    # Keep the Context alive: the device list and devices reference its device manager.
+    ctx = Context()
+    devices = ctx.query_devices()
     if devices.get_count() == 0:
         sys.exit("No Orbbec device found. Check the USB-C cable (USB 3 port) and that the "
                  "udev rules are installed (scripts/install_udev_rules.sh).")
-    info = devices.get_device_by_index(0).get_device_info()
+    device = devices.get_device_by_index(0)
+    info = device.get_device_info()
     print(f"device: {info.get_name()}  serial: {info.get_serial_number()}  "
-          f"fw: {info.get_firmware_version()}")
+          f"fw: {info.get_firmware_version()}  usb: {info.get_connection_type()}")
+    if info.get_connection_type().startswith("USB2"):
+        print("warning: connected over USB 2 - use a USB 3 port/cable for full resolution and depth")
 
-    pipeline = Pipeline()
+    pipeline = Pipeline(device)
     config = Config()
     color_profile = pick_color_profile(pipeline, args.width, args.height, args.fps)
     config.enable_stream(color_profile)

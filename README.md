@@ -53,6 +53,14 @@ whole board is visible) and the board frame axes (origin at the top-left
 chessboard corner, X red, Y green, Z blue). The translation is the board
 origin in the color camera frame, in mm.
 
+## Troubleshooting
+
+- `lsusb -d 2bc5:` should list `2bc5:066b ... Femto Bolt`. If not, it's cabling or power, not software.
+- `python scripts/check_camera.py` (no display needed) prints the device, its USB link and the
+  frame rates for color, depth and aligned color+depth.
+- The demo prints `usb: USB3.x` at start-up. On `USB2.x` color still works, but depth is slow
+  and the depth log shows `Frame data size error`. Use a USB 3 port and a USB 3 C cable.
+
 ## Notes
 
 - Driver: Orbbec SDK v2 via the `pyorbbecsdk2` wheel. It bundles `libOrbbecSDK.so`,
