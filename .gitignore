@@ -3,3 +3,4 @@ __pycache__/
 captures/
 *_detected.png
 .venv/
+Log/
