@@ -10,6 +10,9 @@ shown next to the pose distance as a sanity check.
     python charuco_demo.py --depth         # live, plus depth cross-check
     python charuco_demo.py --image x.png   # detect on a still image (no camera)
 
+With --depth a second window shows the colorized depth image, with the
+detected board outline and centre projected into it.
+
 Keys: q/ESC quit, s save snapshot to captures/.
 
 Speed: frames are fetched and MJPG-decoded on a background thread, the board
@@ -30,6 +33,7 @@ from board import add_board_args, board_from_args, make_detector
 
 DETECT_WIDTH = 1920         # detect on a downscaled copy above this width
 VIEW_SIZE = (1600, 900)     # max size of the displayed image
+DEPTH_VIS_MAX_MM = 5000     # depth colormap range: 0 (red) .. this (dark blue)
 
 
 # --------------------------------------------------------------------------- detection
@@ -94,16 +98,21 @@ def board_center(board):
     return np.array([[sx * s / 2, sy * s / 2, 0.0]], dtype=np.float64)
 
 
-def put_lines(image, lines):
-    # Sized for 1280 px wide and scaled with the image, so text stays readable at any size.
-    s = max(image.shape[1] / 1280, 0.5)
+def put_lines(image, lines, s=None):
+    # Sized for 1280 px wide and scaled with the image (or by s), so text stays readable.
+    if s is None:
+        s = max(image.shape[1] / 1280, 0.5)
     x, y = int(10 * s), int(30 * s)
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, max(int(2 * s), 1)
+    pad = int(4 * s)
     for line in lines:
-        cv2.putText(image, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, (0, 0, 0),
-                    max(int(4 * s), 1), cv2.LINE_AA)
-        cv2.putText(image, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * s, (0, 255, 0),
-                    max(int(2 * s), 1), cv2.LINE_AA)
-        y += int(28 * s)
+        # A box rather than a thick black outline: glyph spacing grows with thickness,
+        # so an outline drawn underneath drifts away from the text along the line.
+        (tw, th), base = cv2.getTextSize(line, font, scale, thick)
+        cv2.rectangle(image, (x - pad, y - th - pad), (x + tw + pad, y + base + pad // 2),
+                      (0, 0, 0), -1)
+        cv2.putText(image, line, (x, y), font, scale, (0, 255, 0), thick, cv2.LINE_AA)
+        y += int(28 * s) + pad
 
 
 def pose_lines(n, rvec, tvec):
@@ -118,11 +127,19 @@ def pose_lines(n, rvec, tvec):
 
 # --------------------------------------------------------------------------- camera
 
+def color_payload(frame):
+    """Copy a color frame out of the SDK buffer: (format, width, height, data, host time in us)."""
+    return (frame.get_format(), frame.get_width(), frame.get_height(),
+            np.array(frame.get_data(), dtype=np.uint8, copy=True), frame.get_system_timestamp_us())
+
+
 def color_to_bgr(frame):
+    return decode_color(*color_payload(frame)[:4])
+
+
+def decode_color(fmt, w, h, data):
     from pyorbbecsdk import OBFormat
 
-    w, h, fmt = frame.get_width(), frame.get_height(), frame.get_format()
-    data = np.asanyarray(frame.get_data())
     if fmt == OBFormat.MJPG:
         return cv2.imdecode(data, cv2.IMREAD_COLOR)
     if fmt == OBFormat.RGB:
@@ -178,31 +195,42 @@ def intrinsics_from_profile(profile):
     return K, dist
 
 
-class FrameGrabber(threading.Thread):
-    """Fetches and decodes frames on a background thread, keeping only the newest.
+class FrameGrabber:
+    """Fetches frames on one thread and decodes color on DECODE_THREADS others.
 
-    Color and depth are kept separately, so color runs at its own rate even
-    when depth is slower.
+    Only the newest frame is ever kept: the fetch thread drains the SDK queue,
+    and decoders always take the newest undecoded frame. A 4K MJPG decode takes
+    ~35 ms, so with one decoder any extra load drops below 30 fps; two give headroom
+    without adding latency. Color and depth are kept separately, so color runs at
+    its own rate whatever depth does.
     """
 
-    def __init__(self, pipeline):
-        super().__init__(daemon=True)
-        self.pipeline = pipeline
-        self.lock = threading.Lock()
-        self.new_color = threading.Event()
-        self.color = None
-        self.depth = None
-        self.running = True
+    DECODE_THREADS = 2
 
-    def run(self):
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.cond = threading.Condition()
+        self.running = True
+        self.raw, self.raw_seq, self.taken_seq = None, 0, 0     # newest undecoded color
+        self.color, self.color_ts, self.color_seq, self.shown_seq = None, 0, 0, 0
+        self.depth = None
+        self.threads = [threading.Thread(target=self._fetch, daemon=True)]
+        self.threads += [threading.Thread(target=self._decode, daemon=True)
+                         for _ in range(self.DECODE_THREADS)]
+
+    def start(self):
+        for t in self.threads:
+            t.start()
+
+    def _fetch(self):
         while self.running:
             frames = self.pipeline.wait_for_frames(100)
             if frames is None:
                 continue
             color_frame = frames.get_color_frame()
             depth_frame = frames.get_depth_frame()
-            # Drain whatever queued up while the last frame was decoded and keep only
-            # the newest of each; decoding stale frames is what builds up latency.
+            # Drain whatever queued up meanwhile and keep only the newest of each;
+            # processing stale frames is what builds up latency.
             while True:
                 frames = self.pipeline.wait_for_frames(0)
                 if frames is None:
@@ -210,25 +238,42 @@ class FrameGrabber(threading.Thread):
                 color_frame = frames.get_color_frame() or color_frame
                 depth_frame = frames.get_depth_frame() or depth_frame
             depth = depth_to_mm(depth_frame) if depth_frame is not None else None
-            color = color_to_bgr(color_frame) if color_frame is not None else None
-            with self.lock:
+            raw = color_payload(color_frame) if color_frame is not None else None
+            with self.cond:
                 if depth is not None:
                     self.depth = depth
-                if color is not None:
-                    self.color = color
-                    self.new_color.set()
+                if raw is not None:
+                    self.raw, self.raw_seq = raw, self.raw_seq + 1
+                    self.cond.notify_all()
+
+    def _decode(self):
+        while self.running:
+            with self.cond:
+                if not self.cond.wait_for(lambda: self.raw_seq > self.taken_seq or not self.running,
+                                          timeout=0.1) or not self.running:
+                    continue
+                seq, raw, self.taken_seq = self.raw_seq, self.raw, self.raw_seq
+            image = decode_color(*raw[:4])
+            with self.cond:
+                if image is not None and seq > self.color_seq:
+                    self.color, self.color_ts, self.color_seq = image, raw[4], seq
+                    self.cond.notify_all()
 
     def latest(self, timeout=1.0):
-        """Newest (color, depth) once a new color frame has arrived, else (None, None)."""
-        if not self.new_color.wait(timeout):
-            return None, None
-        with self.lock:
-            self.new_color.clear()
-            return self.color, self.depth
+        """Newest (color, depth, color host timestamp in us) once a new color frame is
+        decoded, else (None, None, None)."""
+        with self.cond:
+            if not self.cond.wait_for(lambda: self.color_seq > self.shown_seq, timeout):
+                return None, None, None
+            self.shown_seq = self.color_seq
+            return self.color, self.depth, self.color_ts
 
     def stop(self):
         self.running = False
-        self.join(timeout=2)
+        with self.cond:
+            self.cond.notify_all()
+        for t in self.threads:
+            t.join(timeout=2)
 
 
 def run_camera(args, board, detector):
@@ -279,14 +324,22 @@ def run_camera(args, board, detector):
     grabber = FrameGrabber(pipeline)
     grabber.start()
     win = "Femto Bolt ChArUco  |  q/ESC quit, s save"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, int(w * view_scale), int(h * view_scale))
+    # Fixed-size windows that match the images exactly (they are already resized to
+    # VIEW_SIZE). A resizable window with OpenCV's Qt toolbar ends up slightly
+    # smaller than the image and gets software-rescaled on every frame (~10 ms).
+    win_flags = cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL
+    cv2.namedWindow(win, win_flags)
+    depth_win = "Femto Bolt depth"
+    if args.depth:
+        cv2.namedWindow(depth_win, win_flags)
+        dw, dh = depth_profile.get_width(), depth_profile.get_height()
+        depth_view_size = (round(dw * h * view_scale / dh), round(h * view_scale))
     os.makedirs("captures", exist_ok=True)
     t_prev = time.time()
     fps = 0.0
     try:
         while True:
-            image, depth_mm = grabber.latest()
+            image, depth_mm, stamp_us = grabber.latest()
             if image is None:
                 if cv2.waitKey(1) & 0xFF in (27, ord("q")):
                     break
@@ -298,16 +351,26 @@ def run_camera(args, board, detector):
                 image, None, fx=view_scale, fy=view_scale, interpolation=cv2.INTER_AREA)
             draw(view, det, board, K, dist)
             lines = pose_lines(n_corners(det), det["rvec"], det["tvec"])
-            if depth_mm is not None and det["tvec"] is not None:
-                lines.append(depth_check(depth_mm, depth_calib, board, det["rvec"], det["tvec"]))
+            depth_view = None
+            if depth_mm is not None:
+                depth_view = cv2.resize(colorize_depth(depth_mm), depth_view_size,
+                                        interpolation=cv2.INTER_NEAREST)
+                if det["tvec"] is not None:
+                    text = depth_check(depth_mm, depth_view, depth_calib, board,
+                                       det["rvec"], det["tvec"])
+                    lines.append(text)
+                    put_lines(depth_view, text.split("   "))
 
             now = time.time()
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
             t_prev = now
-            lines.append(f"{fps:4.1f} fps")
+            # Time since the frame reached the host (excludes exposure and USB transfer).
+            lines.append(f"{fps:4.1f} fps   latency {now * 1000 - stamp_us / 1000:3.0f} ms")
             put_lines(view, lines)
 
             cv2.imshow(win, view)
+            if depth_view is not None:
+                cv2.imshow(depth_win, depth_view)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
@@ -315,6 +378,9 @@ def run_camera(args, board, detector):
                 stamp = time.strftime("%Y%m%d_%H%M%S")
                 cv2.imwrite(f"captures/{stamp}_raw.png", image)
                 cv2.imwrite(f"captures/{stamp}_overlay.png", view)
+                if depth_mm is not None:
+                    cv2.imwrite(f"captures/{stamp}_depth_mm.png", depth_mm.astype(np.uint16))
+                    cv2.imwrite(f"captures/{stamp}_depth_view.png", depth_view)
                 print(f"saved captures/{stamp}_*.png")
     finally:
         grabber.stop()
@@ -322,19 +388,42 @@ def run_camera(args, board, detector):
         cv2.destroyAllWindows()
 
 
-def depth_check(depth_mm, calib, board, rvec, tvec):
+def colorize_depth(depth_mm):
+    """Depth in mm -> BGR image (near red, far blue, no data black)."""
+    # Saturates beyond DEPTH_VIS_MAX_MM; inverted so near is red.
+    scaled = cv2.bitwise_not(cv2.convertScaleAbs(depth_mm, alpha=255.0 / DEPTH_VIS_MAX_MM))
+    vis = cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
+    return cv2.bitwise_and(vis, vis, mask=cv2.compare(depth_mm, 0, cv2.CMP_GT))
+
+
+def board_to_depth_pixels(points_board, calib, rvec, tvec):
+    """Board-frame points (m) -> (depth camera points in mm, depth image pixels)."""
+    pts_color = (cv2.Rodrigues(rvec)[0] @ points_board.T + tvec) * 1000
+    pts_depth = calib["R"] @ pts_color + calib["t"]
+    px = cv2.projectPoints(pts_depth.T, np.zeros(3), np.zeros(3),
+                           calib["K"], calib["dist"])[0].reshape(-1, 2)
+    return pts_depth, px
+
+
+def depth_check(depth_mm, depth_view, calib, board, rvec, tvec):
     """Compare depth-sensor Z at the board centre with the ChArUco pose.
 
-    The board centre (from the color pose) is moved into the depth camera frame
-    with the factory extrinsics and projected into the raw depth image, so no
-    full-frame alignment is needed.
+    The board (from the color pose) is moved into the depth camera frame with
+    the factory extrinsics and projected into the raw depth image, so no
+    full-frame alignment is needed. Its outline and centre are drawn on depth_view,
+    which may be a resized copy of the depth image.
     """
-    centre_color = (cv2.Rodrigues(rvec)[0] @ board_center(board).T + tvec) * 1000  # mm
-    centre_depth = calib["R"] @ centre_color + calib["t"]
+    s = depth_view.shape[1] / depth_mm.shape[1]
+    sx, sy = board.getChessboardSize()
+    sq = board.getSquareLength()
+    outline = np.array([[0, 0, 0], [sx * sq, 0, 0], [sx * sq, sy * sq, 0], [0, sy * sq, 0]])
+    _, outline_px = board_to_depth_pixels(outline, calib, rvec, tvec)
+    cv2.polylines(depth_view, [np.round(outline_px * s).astype(np.int32)], True, (255, 255, 255), 2)
+
+    centre_depth, ((u, v),) = board_to_depth_pixels(board_center(board), calib, rvec, tvec)
     pose_z = centre_depth[2, 0]
-    (u, v), = cv2.projectPoints(centre_depth.T, np.zeros(3), np.zeros(3),
-                                calib["K"], calib["dist"])[0].reshape(-1, 2)
     u, v = int(round(u)), int(round(v))
+    cv2.drawMarker(depth_view, (round(u * s), round(v * s)), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
     patch = depth_mm[max(v - 5, 0):v + 6, max(u - 5, 0):u + 6]
     valid = patch[patch > 0]
     if valid.size == 0:

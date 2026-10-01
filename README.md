@@ -37,7 +37,9 @@ check that 7 squares measure 266 mm. If they don't, pass the measured size with
 
 `./run_demo.sh` runs the demo with the `femto_bolt` env's Python, no activation
 needed, and passes its arguments through. `./run_depth.sh` does the same with
-depth enabled (`--depth`). Or directly:
+depth enabled (`--depth`): a second window shows the colorized depth image
+(near red, far blue, 0-5 m, no data black) with the detected board outline and
+centre projected into it. Or directly:
 
 ```bash
 conda activate femto_bolt
@@ -66,9 +68,9 @@ origin in the color camera frame, in mm.
   the newest frame, detection runs on a copy at most 1920 px wide (corners refined at full
   resolution), and the depth check maps only the board centre into the depth image instead
   of aligning the whole frame. Frame aggregation is disabled, because the SDK otherwise holds
-  color back until a matching depth frame arrives. On this machine that gives ~29 fps at
-  3840x2160 (~25 fps with `--depth`), with frames ~75 ms old when shown. For more, lower the
-  resolution with `--width 1920 --height 1080`.
+  color back until a matching depth frame arrives. Windows are fixed-size so Qt never
+  rescales them. Over USB 3 this gives 30 fps at 3840x2160, with or without `--depth`;
+  the overlay shows the latency (time since the frame reached the host, ~65 ms).
 
 ## Notes
 
