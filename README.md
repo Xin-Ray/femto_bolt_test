@@ -41,9 +41,9 @@ depth enabled (`--depth`). Or directly:
 
 ```bash
 conda activate femto_bolt
-python charuco_demo.py                  # 1280x720 color, pose overlay
+python charuco_demo.py                  # largest color resolution (3840x2160), pose overlay
 python charuco_demo.py --depth          # + depth-vs-pose distance check at board centre
-python charuco_demo.py --width 1920 --height 1080
+python charuco_demo.py --width 1280 --height 720   # lower resolution, higher frame rate
 python charuco_demo.py --image photo.png    # offline, no camera
 ```
 
@@ -58,9 +58,17 @@ origin in the color camera frame, in mm.
 
 - `lsusb -d 2bc5:` should list `2bc5:066b ... Femto Bolt`. If not, it's cabling or power, not software.
 - `python scripts/check_camera.py` (no display needed) prints the device, its USB link and the
-  frame rates for color, depth and aligned color+depth.
-- The demo prints `usb: USB3.x` at start-up. On `USB2.x` color still works, but depth is slow
-  and the depth log shows `Frame data size error`. Use a USB 3 port and a USB 3 C cable.
+  frame rates the camera delivers for color, depth and both together.
+- The demo prints `usb: USB3.x` at start-up. On `USB2.x` color still runs at full rate, but
+  depth drops to ~7 fps and the SDK log shows `Frame data size error`. Use a USB 3 port and
+  a USB 3 C cable.
+- Frame rate and latency: color is MJPG-decoded on a background thread that always skips to
+  the newest frame, detection runs on a copy at most 1920 px wide (corners refined at full
+  resolution), and the depth check maps only the board centre into the depth image instead
+  of aligning the whole frame. Frame aggregation is disabled, because the SDK otherwise holds
+  color back until a matching depth frame arrives. On this machine that gives ~29 fps at
+  3840x2160 (~25 fps with `--depth`), with frames ~75 ms old when shown. For more, lower the
+  resolution with `--width 1920 --height 1080`.
 
 ## Notes
 

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Run the ChArUco demo with depth enabled (aligned to color, depth-vs-pose check).
-# Needs a USB 3 connection for a usable frame rate.
+# Run the ChArUco demo with depth enabled (depth at the board centre vs pose distance).
+# Over USB 2 the depth value updates at ~7 fps; use USB 3 for the full 30 fps.
 #
 #   ./run_depth.sh
 #   ./run_depth.sh --width 1920 --height 1080
